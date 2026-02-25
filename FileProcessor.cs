@@ -11,7 +11,8 @@ using System.Threading;
 using System.Threading.Tasks;
 
 /// <summary>
-/// Gère le filtrage, la décompression, le traitement métier et l'envoi FTP des fichiers MSC.
+/// Classe responsable du traitement métier des fichiers MSC : 
+/// Filtrage, Décompression, Extraction de données, Compression et Envoi FTP.
 /// </summary>
 public class FileProcessor
 {
@@ -19,14 +20,13 @@ public class FileProcessor
     private readonly ILogger<FileProcessor> _logger;
     private readonly FtpHelper _ftp;
     private readonly HashSet<string> _fileB;
-
-    // Statistiques journalières : Clé = YYYYMMDD
     private readonly Dictionary<string, DailyStats> _stats = new();
 
-    // Suivi indépendant du dernier fichier traité par préfixe (LOMBC1_, LOMBC2_)
-    private readonly ConcurrentDictionary<string, string> _lastProcessedByPrefix = new();
+    // Suivi par clé composée : "PREFIXE|SUFFIXE" (ex: "LOMBC1_|msOriginating")
+    // Permet de traiter msOriginating et msOriginatingSMSinMSC indépendamment.
+    private readonly ConcurrentDictionary<string, string> _lastProcessedTracker = new();
 
-    // Verrous par fichier pour éviter les accès concurrents entre Scan et Watcher
+    // Verrous par fichier pour éviter les conflits d'accès entre les threads.
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileLocks = new();
 
     public ExtractConfig Config => _config;
@@ -37,74 +37,64 @@ public class FileProcessor
         _logger = logger;
         _ftp = ftp;
 
-        // Initialisation de l'environnement
+        // Initialisation du répertoire de sauvegarde de l'état
         Directory.CreateDirectory(Path.GetDirectoryName(_config.LastProcessedPath));
         LoadLastProcessed();
 
-        // Chargement de la liste de filtrage B (HashSet pour recherche O(1))
+        // Chargement du fichier de filtrage B (MSISDN cibles)
         if (File.Exists(_config.FileBPath))
-        {
             _fileB = new HashSet<string>(File.ReadAllLines(_config.FileBPath));
-        }
         else
-        {
-            _logger.LogWarning($"Fichier de filtrage absent : {_config.FileBPath}");
             _fileB = new HashSet<string>();
-        }
     }
 
     /// <summary>
-    /// Scanne les dossiers existants de manière séquentielle lors du démarrage.
+    /// Scanne récursivement tous les mois et jours de l'année configurée.
+    /// Traite les fichiers présents avant le démarrage du service.
     /// </summary>
     public async Task ProcessInitialFoldersSequentiallyAsync(ConcurrentDictionary<string, byte> processedFiles, CancellationToken ct)
     {
         string currentYear = DateTime.Now.ToString("yyyy");
         string folderYear = _config.StartDateHourMin.Length >= 4 ? _config.StartDateHourMin[..4] : currentYear;
-        string folderToScan = _config.StartDateHourMin.Length >= 6 ? _config.StartDateHourMin.Substring(4, 2) : DateTime.Now.ToString("MM");
+        string rootYearPath = Path.Combine(_config.DossierSource, folderYear);
 
-        string rootPath = Path.Combine(_config.DossierSource, folderYear, folderToScan);
-
-        if (!Directory.Exists(rootPath))
+        if (!Directory.Exists(rootYearPath))
         {
-            _logger.LogError($"Répertoire racine introuvable : {rootPath}");
+            _logger.LogWarning($"Répertoire racine introuvable : {rootYearPath}");
             return;
         }
 
-        var dayDirectories = Directory.EnumerateDirectories(rootPath).OrderBy(d => d);
-
-        foreach (var dayDir in dayDirectories)
+        // Itération sur les dossiers de mois (01, 02, 03...)
+        foreach (var monthDir in Directory.EnumerateDirectories(rootYearPath).OrderBy(m => m))
         {
-            if (ct.IsCancellationRequested) break;
-
-            string dayName = Path.GetFileName(dayDir);
-            _logger.LogInformation($"---> [PHASE SCAN] Dossier jour : {dayName}");
-
-            var files = Directory.EnumerateFiles(dayDir, "*.gz").OrderBy(f => f).ToList();
-            int count = 0;
-
-            foreach (var file in files)
+            // Itération sur les dossiers de jours (01, 02...)
+            foreach (var dayDir in Directory.EnumerateDirectories(monthDir).OrderBy(d => d))
             {
-                if (IsFileEligible(file))
+                if (ct.IsCancellationRequested) break;
+
+                // On traite les fichiers .gz par ordre alphabétique
+                var files = Directory.EnumerateFiles(dayDir, "*.gz").OrderBy(f => f).ToList();
+                foreach (var file in files)
                 {
-                    _logger.LogInformation($"      [OK] Détecté : {Path.GetFileName(file)}");
-                    await ProcessFileIfEligibleAsync(file);
-                    processedFiles.TryAdd(file, 0);
-                    count++;
+                    if (IsFileEligible(file))
+                    {
+                        _logger.LogInformation($"      [OK] Détecté (Scan) : {Path.GetFileName(file)}");
+                        await ProcessFileIfEligibleAsync(file);
+                        processedFiles.TryAdd(file, 0); // Marqué comme traité pour le Worker
+                    }
                 }
             }
-
-            if (count > 0)
-                _logger.LogInformation($"---> [FIN JOURNÉE] {dayName} terminé ({count} fichiers traités).");
         }
     }
 
     /// <summary>
-    /// Point d'entrée sécurisé pour traiter un fichier (vérifie l'éligibilité et verrouille l'accès).
+    /// Vérifie l'éligibilité d'un fichier et gère le verrouillage avant traitement.
     /// </summary>
     public async Task ProcessFileIfEligibleAsync(string filePath)
     {
         if (!IsFileEligible(filePath)) return;
 
+        // Verrouillage par fichier pour éviter les accès concurrents
         var fileLock = _fileLocks.GetOrAdd(filePath, new SemaphoreSlim(1, 1));
         await fileLock.WaitAsync();
 
@@ -113,10 +103,10 @@ public class FileProcessor
             string fileName = Path.GetFileName(filePath);
             string date = ExtractDate(fileName);
 
-            _logger.LogInformation($"      [TRAITEMENT EN COURS] {fileName}");
+            _logger.LogInformation($"      [TRAITEMENT] {fileName}");
             await ProcessFileAsync(filePath, fileName, date);
 
-            // Persistance de l'état par préfixe après succès
+            // Mise à jour du registre de dernier fichier traité
             UpdateLastProcessed(fileName);
         }
         finally
@@ -125,18 +115,16 @@ public class FileProcessor
         }
     }
 
+    /// <summary>
+    /// Logique principale : Décompression, filtrage métier, re-compression et archivage.
+    /// </summary>
     private async Task ProcessFileAsync(string path, string fileName, string date)
     {
-        string year = date.Substring(0, 4);
-        string month = date.Substring(4, 2);
-        string day = date.Substring(6, 2);
-        string key = year + month + day;
-
-        // Gestion des DailyStats
+        string key = date[..8]; // Clé YYYYMMDD pour les stats
         if (!_stats.ContainsKey(key)) _stats[key] = new DailyStats();
         _stats[key].Detected++;
 
-        // Création d'un espace de travail temporaire unique
+        // Création d'un dossier temporaire unique pour la décompression
         string tempDir = Path.Combine(Path.GetTempPath(), "MscExtract_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempDir);
 
@@ -145,7 +133,7 @@ public class FileProcessor
             string txtFile = Path.Combine(tempDir, fileName.Replace(".gz", ""));
             Decompress(path, txtFile);
 
-            // Routage vers le filtre spécifique
+            // Choix du filtre en fonction du type de fichier
             bool isMatch = fileName.Contains("_msOriginating")
                 ? await ProcessMsOriginating(txtFile)
                 : await ProcessSmsMsc(txtFile);
@@ -158,18 +146,16 @@ public class FileProcessor
 
             _stats[key].Processed++;
 
-            // Arborescence de sortie : Année > Mois > Jour
-            string outDir = Path.Combine(_config.OutputDirectory, year, month, day);
+            // Préparation du dossier de sortie (Année/Mois/Jour)
+            string outDir = Path.Combine(_config.OutputDirectory, date[..4], date.Substring(4, 2), date.Substring(6, 2));
             Directory.CreateDirectory(outDir);
 
             string finalPath = Path.Combine(outDir, fileName);
             Compress(txtFile, finalPath);
 
-            // Envoi SFTP si configuré
+            // Envoi FTP si activé
             if (_config.SendFileFTP.Equals("oui", StringComparison.OrdinalIgnoreCase))
-            {
                 HandleFtpSendingWithRetry(finalPath, key);
-            }
         }
         catch (Exception ex)
         {
@@ -177,20 +163,14 @@ public class FileProcessor
         }
         finally
         {
-            // Nettoyage du dossier temporaire sécurisé par try-catch
-            try
-            {
-                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"Nettoyage différé pour {tempDir} : {ex.Message}");
-            }
+            // Nettoyage sécurisé du répertoire temporaire
+            try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true); }
+            catch { /* Suppression différée si le fichier est encore verrouillé par l'OS */ }
         }
     }
 
     /// <summary>
-    /// Logique de filtrage robuste : gère les doublons temporels et l'indépendance des préfixes.
+    /// Détermine si un fichier doit être traité en fonction de son nom, de sa date et de l'historique.
     /// </summary>
     private bool IsFileEligible(string filePath)
     {
@@ -198,62 +178,66 @@ public class FileProcessor
         string fileDate = ExtractDate(fileName);
         if (fileDate == null) return false;
 
-        // 1. Validation Préfixe
+        // Analyse du préfixe et du suffixe
         var prefixes = _config.PrefixesFichiers.Split(',').Select(p => p.Trim()).ToList();
-        string currentPrefix = prefixes.FirstOrDefault(p => fileName.StartsWith(p, StringComparison.OrdinalIgnoreCase));
-        if (currentPrefix == null) return false;
-
-        // 2. Validation Suffixe
         var suffixes = _config.SuffixesFichiers.Split(',').Select(s => s.Trim()).ToList();
-        bool hasSuffix = suffixes.Any(s => fileName.EndsWith(s.Trim(), StringComparison.OrdinalIgnoreCase));
 
-        if (!File.Exists(filePath) || new FileInfo(filePath).Length == 0 || !hasSuffix) return false;
+        string currentPrefix = prefixes.FirstOrDefault(p => fileName.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+        string currentSuffix = suffixes.FirstOrDefault(s => fileName.EndsWith(s, StringComparison.OrdinalIgnoreCase));
 
-        // 3. Comparaison avec le dernier traité pour ce flux spécifique
-        if (_lastProcessedByPrefix.TryGetValue(currentPrefix, out string lastFile))
+        // Filtrage de base (format, existence, taille)
+        if (currentPrefix == null || currentSuffix == null) return false;
+        if (!File.Exists(filePath) || new FileInfo(filePath).Length == 0) return false;
+
+        // Vérification par rapport au dernier fichier traité pour CE préfixe ET CE suffixe
+        string trackingKey = $"{currentPrefix}|{currentSuffix}";
+
+        if (_lastProcessedTracker.TryGetValue(trackingKey, out string lastFile))
         {
-            // Ignorer uniquement si le nom est strictement identique (doublon FileSystemWatcher)
-            if (fileName.Equals(lastFile, StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogDebug($"      [IGNORE] {fileName} (Doublon déjà traité)");
-                return false;
-            }
+            // Élimine les doublons de notification
+            if (fileName.Equals(lastFile, StringComparison.OrdinalIgnoreCase)) return false;
 
-            // Comparaison des dates pour éviter de traiter des fichiers plus anciens après un redémarrage
             string lastDate = ExtractDate(lastFile);
+            // Empêche de revenir en arrière dans le temps pour un même type de fichier
             if (lastDate != null && string.Compare(fileDate, lastDate) < 0)
             {
-                _logger.LogInformation($"      [IGNORE] {fileName} (Date antérieure au dernier fichier traité : {lastFile})");
+                _logger.LogDebug($"      [IGNORE] {fileName} (Plus ancien que le dernier traité)");
                 return false;
             }
-
-            // Note : Si les dates sont identiques mais les noms différents, on laisse passer (ex: msOriginating vs SMSinMSC)
         }
 
-        // 4. Filtre de date de démarrage (StartDateHourMin)
+        // Filtre de date de début configuré
         if (!string.IsNullOrEmpty(_config.StartDateHourMin) && string.Compare(fileDate, _config.StartDateHourMin) < 0)
-        {
             return false;
-        }
 
         return true;
     }
 
+    /// <summary>
+    /// Met à jour le registre LastProcessed.txt avec une clé séparant préfixe et suffixe.
+    /// </summary>
     private void UpdateLastProcessed(string fileName)
     {
         var prefixes = _config.PrefixesFichiers.Split(',').Select(p => p.Trim());
+        var suffixes = _config.SuffixesFichiers.Split(',').Select(s => s.Trim());
+
         string currentPrefix = prefixes.FirstOrDefault(p => fileName.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+        string currentSuffix = suffixes.FirstOrDefault(s => fileName.EndsWith(s, StringComparison.OrdinalIgnoreCase));
 
-        if (currentPrefix != null)
+        if (currentPrefix != null && currentSuffix != null)
         {
-            _lastProcessedByPrefix[currentPrefix] = fileName;
+            string trackingKey = $"{currentPrefix}|{currentSuffix}";
+            _lastProcessedTracker[trackingKey] = fileName;
 
-            // Sauvegarde multi-ligne : PREFIXE|NOM_FICHIER
-            var lines = _lastProcessedByPrefix.Select(kvp => $"{kvp.Key}|{kvp.Value}");
+            // Utilisation d'un séparateur robuste pour la sérialisation
+            var lines = _lastProcessedTracker.Select(kvp => $"{kvp.Key}#|#{kvp.Value}");
             File.WriteAllLines(_config.LastProcessedPath, lines);
         }
     }
 
+    /// <summary>
+    /// Charge l'historique des traitements depuis le fichier LastProcessed.txt au démarrage.
+    /// </summary>
     private void LoadLastProcessed()
     {
         if (File.Exists(_config.LastProcessedPath))
@@ -261,12 +245,61 @@ public class FileProcessor
             var lines = File.ReadAllLines(_config.LastProcessedPath);
             foreach (var line in lines)
             {
-                var parts = line.Split('|');
-                if (parts.Length == 2) _lastProcessedByPrefix[parts[0]] = parts[1];
+                var parts = line.Split(new[] { "#|#" }, StringSplitOptions.None);
+                if (parts.Length == 2) _lastProcessedTracker[parts[0]] = parts[1];
             }
         }
     }
 
+    /// <summary>
+    /// Extrait la date (14 caractères) du nom du fichier selon le format MSC standard.
+    /// </summary>
+    private static string ExtractDate(string f)
+    {
+        var p = f.Split('_');
+        return p.Length > 1 && p[1].Length >= 14 ? p[1][..14] : null;
+    }
+
+    /// <summary>
+    /// Décompression GZip.
+    /// </summary>
+    private static void Decompress(string gz, string txt)
+    {
+        using var fs = File.OpenRead(gz);
+        using var gzst = new GZipStream(fs, CompressionMode.Decompress);
+        using var outFs = File.Create(txt);
+        gzst.CopyTo(outFs);
+    }
+
+    /// <summary>
+    /// Compression GZip (niveau optimal).
+    /// </summary>
+    private static void Compress(string txt, string gz)
+    {
+        using var fs = File.Create(gz);
+        using var gzst = new GZipStream(fs, CompressionLevel.Optimal);
+        using var inFs = File.OpenRead(txt);
+        inFs.CopyTo(gzst);
+    }
+
+    /// <summary>
+    /// Normalisation des numéros de téléphone (ajout/retrait préfixe Togo).
+    /// </summary>
+    private static string Normalize(string n) => n.StartsWith("00228") ? "228" + n[5..] : (n.StartsWith("00") ? n[2..] : (n.Length == 8 ? "228" + n : n));
+
+    /// <summary>
+    /// Filtre spécifique pour msOriginating (Voix).
+    /// </summary>
+    private async Task<bool> ProcessMsOriginating(string txt) => await FilterGeneric(txt, 7, 63, "02");
+
+    /// <summary>
+    /// Filtre spécifique pour SMSinMSC (SMS).
+    /// </summary>
+    private async Task<bool> ProcessSmsMsc(string txt) => await FilterGeneric(txt, 31, 4, null);
+
+    /// <summary>
+    /// Logique de filtrage générique : lit le fichier ligne par ligne, normalise et applique le filtre B ou une valeur fixe.
+    /// </summary>
     private async Task<bool> FilterGeneric(string txt, int numIdx, int filterIdx, string filterVal)
     {
         bool ok = false;
@@ -286,6 +319,7 @@ public class FileProcessor
                 if (cols.Length <= Math.Max(numIdx, filterIdx)) continue;
 
                 cols[numIdx] = Normalize(cols[numIdx]);
+                // Si filterVal est null, on check dans le HashSet FileB, sinon on compare à la valeur fixe.
                 bool isTarget = (filterVal == null) ? _fileB.Contains(cols[filterIdx]) : cols[filterIdx] == filterVal;
 
                 if (isTarget)
@@ -301,6 +335,9 @@ public class FileProcessor
         return ok;
     }
 
+    /// <summary>
+    /// Gère l'envoi SFTP avec un mécanisme de tentative (retry) en cas d'échec.
+    /// </summary>
     private void HandleFtpSendingWithRetry(string file, string dayKey)
     {
         int tries = 0; bool sent = false;
@@ -313,31 +350,4 @@ public class FileProcessor
             if (!sent) Thread.Sleep(_config.FtpRetryDelayMs);
         }
     }
-
-    private static string Normalize(string n) => n.StartsWith("00228") ? "228" + n[5..] : (n.StartsWith("00") ? n[2..] : (n.Length == 8 ? "228" + n : n));
-
-    private static string ExtractDate(string f)
-    {
-        var p = f.Split('_');
-        return p.Length > 1 && p[1].Length >= 14 ? p[1][..14] : null;
-    }
-
-    private static void Decompress(string gz, string txt)
-    {
-        using var fs = File.OpenRead(gz);
-        using var gzst = new GZipStream(fs, CompressionMode.Decompress);
-        using var outFs = File.Create(txt);
-        gzst.CopyTo(outFs);
-    }
-
-    private static void Compress(string txt, string gz)
-    {
-        using var fs = File.Create(gz);
-        using var gzst = new GZipStream(fs, CompressionLevel.Optimal);
-        using var inFs = File.OpenRead(txt);
-        inFs.CopyTo(gzst);
-    }
-
-    private async Task<bool> ProcessMsOriginating(string txt) => await FilterGeneric(txt, 7, 63, "02");
-    private async Task<bool> ProcessSmsMsc(string txt) => await FilterGeneric(txt, 31, 4, null);
 }
