@@ -181,14 +181,17 @@ public class FileProcessor
         {
             // Nettoyage sécurisé du répertoire temporaire
             try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true); }
-            catch { /* Suppression différée si le fichier est encore verrouillé par l'OS */ }
+            catch (Exception ex)
+            { /* Suppression différée si le fichier est encore verrouillé par l'OS */
+                _logger.LogWarning($"Nettoyage différé pour {tempDir} : {ex.Message}");
+            }
         }
     }
 
     /// <summary>
     /// Détermine si un fichier doit être traité en fonction de son nom, de sa date et de l'historique.
     /// </summary>
-    private bool IsFileEligible(string filePath)
+    public bool IsFileEligible(string filePath)
     {
         string fileName = Path.GetFileName(filePath);
         string fileDate = ExtractDate(fileName);
