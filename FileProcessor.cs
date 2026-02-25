@@ -65,23 +65,39 @@ public class FileProcessor
         }
 
         // Itération sur les dossiers de mois (01, 02, 03...)
-        foreach (var monthDir in Directory.EnumerateDirectories(rootYearPath).OrderBy(m => m))
+        var monthDirs = Directory.EnumerateDirectories(rootYearPath).OrderBy(m => m);
+        foreach (var monthDir in monthDirs)
         {
+            string monthName = Path.GetFileName(monthDir);
+
             // Itération sur les dossiers de jours (01, 02...)
-            foreach (var dayDir in Directory.EnumerateDirectories(monthDir).OrderBy(d => d))
+            var dayDirs = Directory.EnumerateDirectories(monthDir).OrderBy(d => d);
+            foreach (var dayDir in dayDirs)
             {
                 if (ct.IsCancellationRequested) break;
 
+                string dayName = Path.GetFileName(dayDir);
+
+                // --- AJOUT DU LOG DE PROGRESSION ---
+                _logger.LogInformation($"---> [SCAN] Analyse du dossier : {monthName}/{dayName}");
+
                 // On traite les fichiers .gz par ordre alphabétique
                 var files = Directory.EnumerateFiles(dayDir, "*.gz").OrderBy(f => f).ToList();
+                int processedInFolder = 0;
+
                 foreach (var file in files)
                 {
                     if (IsFileEligible(file))
                     {
-                        _logger.LogInformation($"      [OK] Détecté (Scan) : {Path.GetFileName(file)}");
                         await ProcessFileIfEligibleAsync(file);
-                        processedFiles.TryAdd(file, 0); // Marqué comme traité pour le Worker
+                        processedFiles.TryAdd(file, 0);
+                        processedInFolder++;
                     }
+                }
+
+                if (processedInFolder > 0)
+                {
+                    _logger.LogInformation($"      [FIN DOSSIER] {processedInFolder} fichiers traités dans {monthName}/{dayName}");
                 }
             }
         }
