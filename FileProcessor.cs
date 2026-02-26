@@ -157,6 +157,8 @@ public class FileProcessor
             if (!isMatch)
             {
                 _stats[key].Deleted++;
+                // LOG : On informe que le fichier est vide après filtrage
+                _logger.LogInformation($"      [IGNORÉ] {fileName} : Aucun MSISDN cible trouvé dans le fichier.");
                 return;
             }
 
@@ -168,6 +170,8 @@ public class FileProcessor
 
             string finalPath = Path.Combine(outDir, fileName);
             Compress(txtFile, finalPath);
+  
+            _logger.LogInformation($"      [SUCCÈS] Fichier généré : {finalPath}");
 
             // Envoi FTP si activé
             if (_config.SendFileFTP.Equals("oui", StringComparison.OrdinalIgnoreCase))

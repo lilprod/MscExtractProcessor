@@ -7,9 +7,6 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
-/// <summary>
-/// Service de fond qui orchestre le scan initial et le traitement en temps réel.
-/// </summary>
 public class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
@@ -18,11 +15,11 @@ public class Worker : BackgroundService
     private FileSystemWatcher _watcher;
     private string _currentWatchedYear;
 
-    // Queue pour stocker les fichiers détectés par le Watcher (mémoire tampon)
+    // Queue haute performance pour le flux massif de fichiers
     private readonly ConcurrentQueue<string> _fileQueue = new();
     private readonly SemaphoreSlim _queueSemaphore = new(0);
 
-    // Registre pour éviter de traiter deux fois le même fichier (Scan initial vs Watcher)
+    // Registre anti-doublon pour éviter les conflits Scan/Watcher
     private readonly ConcurrentDictionary<string, byte> _processedFiles = new();
 
     public Worker(ILogger<Worker> logger, FileProcessor processor)
@@ -33,76 +30,74 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("=== INITIALISATION DU SERVICE MSC EXTRACT ===");
+        _logger.LogInformation("=== INITIALISATION DU SERVICE MSC EXTRACT (MODE HAUTE DISPONIBILITÉ) ===");
 
-        // 1. Activer le Watcher immédiatement sur l'année en cours
+        // 1. Initialisation de la surveillance temps réel
         StartWatcher();
 
-        // 2. Lancement du Scan Initial Séquentiel (Rattrapage des fichiers existants)
-        _logger.LogInformation("Début du traitement séquentiel des dossiers existants...");
+        // 2. Rattrapage des fichiers existants (Scan initial)
+        _logger.LogInformation("Début du scan de rattrapage des dossiers...");
         await _processor.ProcessInitialFoldersSequentiallyAsync(_processedFiles, stoppingToken);
 
-        _logger.LogInformation("=== SCAN INITIAL TERMINÉ. PASSAGE AU TRAITEMENT TEMPS RÉEL ===");
+        _logger.LogInformation("=== SCAN INITIAL TERMINÉ. TRAITEMENT DU FLUX EN COURS ===");
 
-        // 3. Boucle principale de traitement
+        // 3. Boucle principale de consommation de la file d'attente
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                // Vérification du changement d'année (ex: passage de 2026 à 2027)
                 CheckAndHandleYearChange();
-
-                // Nettoyage quotidien de la mémoire à minuit (pour garder le service léger)
                 CleanProcessedCacheAtMidnight();
 
-                // Attente d'un signal de la file d'attente
+                // Attente d'un nouveau fichier dans la file
                 await _queueSemaphore.WaitAsync(stoppingToken);
 
                 if (_fileQueue.TryDequeue(out var filePath))
                 {
-                    // Sécurité anti-doublon (si le scan initial et le watcher voient le même fichier)
+                    // Sécurité anti-doublon
                     if (_processedFiles.TryAdd(filePath, 0))
                     {
-                        _logger.LogInformation($"[TEMPS RÉEL] Nouveau fichier : {Path.GetFileName(filePath)}");
-
-                        // On attend que le système source ait fini d'écrire le fichier
+                        // On attend que le fichier soit totalement écrit/libéré par le MSC
                         await WaitForFileReady(filePath);
 
-                        // Traitement métier via le processeur
-                        await _processor.ProcessFileIfEligibleAsync(filePath);
+                        // Vérification finale de la taille (> 1 Ko) avant traitement métier
+                        var fileInfo = new FileInfo(filePath);
+                        if (fileInfo.Exists && fileInfo.Length > 1024)
+                        {
+                            string type = filePath.Contains("SMSinMSC", StringComparison.OrdinalIgnoreCase) ? "SMS" : "VOIX";
+                            _logger.LogInformation($"[TRAITEMENT] {type} détecté : {fileInfo.Name} ({fileInfo.Length / 1024} Ko)");
+
+                            await _processor.ProcessFileIfEligibleAsync(filePath);
+                        }
+                        else if (fileInfo.Exists)
+                        {
+                            _logger.LogDebug($"[IGNORÉ] Fichier trop petit (< 1Ko) : {fileInfo.Name}");
+                        }
                     }
                 }
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                _logger.LogError($"Erreur dans la boucle Worker : {ex.Message}");
+                _logger.LogError($"Erreur boucle principale : {ex.Message}");
             }
         }
     }
 
-    /// <summary>
-    /// Initialise ou redémarre le Watcher sur le dossier de l'année.
-    /// </summary>
     private void StartWatcher()
     {
         string yearToWatch = DateTime.Now.ToString("yyyy");
-
-        // Si c'est le premier démarrage, on respecte l'année de StartDateHourMin si fournie
         if (string.IsNullOrEmpty(_currentWatchedYear) && _processor.Config.StartDateHourMin.Length >= 4)
-        {
             yearToWatch = _processor.Config.StartDateHourMin[..4];
-        }
 
         string path = Path.Combine(_processor.Config.DossierSource, yearToWatch);
 
         if (!Directory.Exists(path))
         {
-            _logger.LogError($"Dossier cible introuvable : {path}. Le Watcher attendra une création manuelle ou le prochain cycle.");
+            _logger.LogError($"Dossier source introuvable : {path}");
             return;
         }
 
-        // Nettoyage de l'ancien Watcher
         if (_watcher != null)
         {
             _watcher.EnableRaisingEvents = false;
@@ -110,65 +105,70 @@ public class Worker : BackgroundService
         }
 
         _currentWatchedYear = yearToWatch;
-        _watcher = new FileSystemWatcher(path, "*.gz")
+
+        // Configuration "Gros Volume"
+        _watcher = new FileSystemWatcher(path, "*.*")
         {
-            EnableRaisingEvents = true,
-            IncludeSubdirectories = true, // Permet de surveiller 02, 03, 04... automatiquement
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite
+            IncludeSubdirectories = true,
+            InternalBufferSize = 65536, // Buffer maximum (64Ko) pour 100K fichiers
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+            EnableRaisingEvents = true
         };
 
         _watcher.Created += (s, e) => EnqueueFile(e.FullPath);
         _watcher.Changed += (s, e) => EnqueueFile(e.FullPath);
+        _watcher.Renamed += (s, e) => EnqueueFile(e.FullPath);
 
-        // Gestion robuste des erreurs réseau ou système
         _watcher.Error += (s, e) => {
-            _logger.LogWarning($"Watcher Error: {e.GetException().Message}. Restarting in 10s...");
-            Task.Delay(10000).ContinueWith(_ => StartWatcher());
+            _logger.LogWarning($"Watcher Error: {e.GetException().Message}. Restarting...");
+            Task.Delay(5000).ContinueWith(_ => StartWatcher());
         };
 
-        _logger.LogInformation($"Watcher actif sur l'année complète : {path}");
+        _logger.LogInformation($"Watcher actif (Buffer 64Ko) sur : {path}");
     }
 
-    /// <summary>
-    /// Filtre et ajoute un fichier à la file d'attente de traitement.
-    /// </summary>
     private void EnqueueFile(string path)
     {
         try
         {
-            // Vérification métier immédiate (préfixe, suffixe, date)
-            if (_processor.IsFileEligible(path))
+            // On ignore les dossiers
+            if (Directory.Exists(path)) return;
+
+            string fileName = Path.GetFileName(path);
+
+            // Récupération dynamique des suffixes autorisés depuis le appsettings
+            var allowedSuffixes = _processor.Config.SuffixesFichiers
+                .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim())
+                .ToList();
+
+            // Filtrage ultra-rapide par suffixe pour ne pas saturer la file
+            if (allowedSuffixes.Any(s => fileName.EndsWith(s, StringComparison.OrdinalIgnoreCase)))
             {
-                if (File.Exists(path) && new FileInfo(path).Length > 0)
-                {
-                    _fileQueue.Enqueue(path);
-                    _queueSemaphore.Release();
-                }
+                _fileQueue.Enqueue(path);
+                _queueSemaphore.Release();
             }
         }
-        catch { /* Ignoré : le fichier est peut-être en cours de verrouillage par l'OS */ }
+        catch { /* Erreur silencieuse pour ne pas bloquer le thread du Watcher */ }
     }
 
-    /// <summary>
-    /// Boucle d'attente pour s'assurer que le fichier n'est plus utilisé par le MSC.
-    /// </summary>
     private async Task WaitForFileReady(string path)
     {
         int attempts = 0;
-        while (attempts < 15)
+        while (attempts < 20) // Augmenté à 20 tentatives pour les gros fichiers voix
         {
             try
             {
                 using var fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None);
-                return; // Fichier libre
+                return;
             }
             catch (IOException)
             {
                 attempts++;
-                await Task.Delay(2000); // Attente de 2 secondes
+                await Task.Delay(2000);
             }
         }
-        _logger.LogWarning($"Le fichier {path} est resté verrouillé trop longtemps.");
+        _logger.LogWarning($"Fichier verrouillé trop longtemps (ignoré) : {path}");
     }
 
     private void CheckAndHandleYearChange()
@@ -176,18 +176,16 @@ public class Worker : BackgroundService
         string currentYear = DateTime.Now.ToString("yyyy");
         if (_currentWatchedYear != null && currentYear != _currentWatchedYear)
         {
-            _logger.LogInformation($"Changement d'année détecté : {_currentWatchedYear} -> {currentYear}");
+            _logger.LogInformation($"Nouvelle année : {currentYear}. Redémarrage Watcher.");
             StartWatcher();
         }
     }
 
     private void CleanProcessedCacheAtMidnight()
     {
-        // Si le cache dépasse 50 000 entrées, on le vide pour libérer la RAM
-        // (Les doublons seront de toute façon gérés par LastProcessed.txt)
-        if (_processedFiles.Count > 50000)
+        if (_processedFiles.Count > 100000) // Seuil adapté à votre volume de 100K
         {
-            _logger.LogInformation("Nettoyage préventif du cache des fichiers traités.");
+            _logger.LogInformation("Nettoyage du cache anti-doublon (100K+ entrées).");
             _processedFiles.Clear();
         }
     }
