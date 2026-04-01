@@ -12,8 +12,8 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly FileProcessor _processor;
 
-    private FileSystemWatcher _watcher;
-    private string _currentWatchedYear;
+    private FileSystemWatcher? _watcher;
+    private string? _currentWatchedYear;
 
     // Queue haute performance pour le flux massif de fichiers
     private readonly ConcurrentQueue<string> _fileQueue = new();

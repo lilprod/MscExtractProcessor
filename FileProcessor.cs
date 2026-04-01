@@ -19,7 +19,6 @@ public class FileProcessor
     private readonly ExtractConfig _config;
     private readonly ILogger<FileProcessor> _logger;
     private readonly FtpHelper _ftp;
-    private readonly HashSet<string> _fileB;
     private readonly Dictionary<string, DailyStats> _stats = new();
 
     // Suivi par clé composée : "PREFIXE|SUFFIXE" (ex: "LOMBC1_|msOriginating")
@@ -31,21 +30,100 @@ public class FileProcessor
 
     public ExtractConfig Config => _config;
 
+    private HashSet<string> _fileB = new HashSet<string>();
+    private FileSystemWatcher? _fileBWatcher;
+
     public FileProcessor(IOptions<ExtractConfig> config, ILogger<FileProcessor> logger, FtpHelper ftp)
     {
         _config = config.Value;
         _logger = logger;
         _ftp = ftp;
 
-        // Initialisation du répertoire de sauvegarde de l'état
-        Directory.CreateDirectory(Path.GetDirectoryName(_config.LastProcessedPath));
+        // 1. Initialisation du suivi de progression
+        string? lastProcessedDir = Path.GetDirectoryName(_config.LastProcessedPath);
+        if (!string.IsNullOrEmpty(lastProcessedDir))
+        {
+            Directory.CreateDirectory(lastProcessedDir);
+        }
         LoadLastProcessed();
 
-        // Chargement du fichier de filtrage B (MSISDN cibles)
-        if (File.Exists(_config.FileBPath))
-            _fileB = new HashSet<string>(File.ReadAllLines(_config.FileBPath));
+        // 2. Chargement initial de FileB
+        LoadFileB();
+
+        // 3. Configuration du Watcher pour le rechargement dynamique
+        SetupFileBWatcher();
+    }
+
+    private void SetupFileBWatcher()
+    {
+        string? directory = Path.GetDirectoryName(_config.FileBPath);
+        string fileName = Path.GetFileName(_config.FileBPath);
+
+        if (!string.IsNullOrEmpty(directory) && Directory.Exists(directory))
+        {
+            _fileBWatcher = new FileSystemWatcher(directory, fileName)
+            {
+                NotifyFilter = NotifyFilters.LastWrite,
+                EnableRaisingEvents = true
+            };
+
+            // On s'abonne à l'événement de modification
+            _fileBWatcher.Changed += (s, e) => LoadFileB();
+
+            _logger.LogInformation($"[WATCHER] Surveillance active sur le fichier cible : {_config.FileBPath}");
+        }
         else
-            _fileB = new HashSet<string>();
+        {
+            _logger.LogWarning($"[WATCHER] Impossible de surveiller le répertoire de FileB : {directory}");
+        }
+    }
+
+    private void LoadFileB()
+    {
+        int attempts = 0;
+        while (attempts < 5)
+        {
+            try
+            {
+                if (File.Exists(_config.FileBPath))
+                {
+                    // Lecture sécurisée avec partage d'accès (évite les conflits avec Notepad/Excel)
+                    using var fs = new FileStream(_config.FileBPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var sr = new StreamReader(fs, Encoding.UTF8);
+
+                    var lines = new List<string>();
+                    while (!sr.EndOfStream)
+                    {
+                        var line = sr.ReadLine();
+                        if (!string.IsNullOrWhiteSpace(line))
+                            lines.Add(line.Trim());
+                    }
+
+                    // Remplacement "Thread-Safe" du HashSet
+                    _fileB = new HashSet<string>(lines);
+
+                    _logger.LogInformation($"[CIBLAGE] FileB chargé/mis à jour : {_fileB.Count} numéros actifs.");
+                    return;
+                }
+                else
+                {
+                    _fileB = new HashSet<string>();
+                    _logger.LogWarning($"[CIBLAGE] Fichier introuvable à l'emplacement : {_config.FileBPath}");
+                    return;
+                }
+            }
+            catch (IOException)
+            {
+                attempts++;
+                _logger.LogWarning($"[CIBLAGE] Tentative {attempts}/5 : Le fichier est verrouillé. Nouvel essai dans 1s...");
+                Thread.Sleep(1000);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"[CIBLAGE] Erreur imprévue : {ex.Message}");
+                break;
+            }
+        }
     }
 
     /// <summary>
@@ -117,9 +195,17 @@ public class FileProcessor
         try
         {
             string fileName = Path.GetFileName(filePath);
-            string date = ExtractDate(fileName);
+            string? date = ExtractDate(fileName);
+
+            if (string.IsNullOrEmpty(date))
+            {
+                _logger.LogWarning($"[IGNORÉ] Impossible d'extraire la date du fichier : {fileName}");
+                return;
+            }
 
             _logger.LogInformation($"      [TRAITEMENT] {fileName}");
+
+            // Maintenant 'date' est garanti non-nul pour ProcessFileAsync
             await ProcessFileAsync(filePath, fileName, date);
 
             // Mise à jour du registre de dernier fichier traité
@@ -198,15 +284,15 @@ public class FileProcessor
     public bool IsFileEligible(string filePath)
     {
         string fileName = Path.GetFileName(filePath);
-        string fileDate = ExtractDate(fileName);
+        string? fileDate = ExtractDate(fileName);
         if (fileDate == null) return false;
 
         // Analyse du préfixe et du suffixe
         var prefixes = _config.PrefixesFichiers.Split(',').Select(p => p.Trim()).ToList();
         var suffixes = _config.SuffixesFichiers.Split(',').Select(s => s.Trim()).ToList();
 
-        string currentPrefix = prefixes.FirstOrDefault(p => fileName.StartsWith(p, StringComparison.OrdinalIgnoreCase));
-        string currentSuffix = suffixes.FirstOrDefault(s => fileName.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+        string? currentPrefix = prefixes.FirstOrDefault(p => fileName.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+        string? currentSuffix = suffixes.FirstOrDefault(s => fileName.EndsWith(s, StringComparison.OrdinalIgnoreCase));
 
         // Filtrage de base (format, existence, taille)
         if (currentPrefix == null || currentSuffix == null) return false;
@@ -215,12 +301,12 @@ public class FileProcessor
         // Vérification par rapport au dernier fichier traité pour CE préfixe ET CE suffixe
         string trackingKey = $"{currentPrefix}|{currentSuffix}";
 
-        if (_lastProcessedTracker.TryGetValue(trackingKey, out string lastFile))
+        if (_lastProcessedTracker.TryGetValue(trackingKey, out string? lastFile))
         {
             // Élimine les doublons de notification
             if (fileName.Equals(lastFile, StringComparison.OrdinalIgnoreCase)) return false;
 
-            string lastDate = ExtractDate(lastFile);
+            string? lastDate = ExtractDate(lastFile);
             // Empêche de revenir en arrière dans le temps pour un même type de fichier
             if (lastDate != null && string.Compare(fileDate, lastDate) < 0)
             {
@@ -244,8 +330,8 @@ public class FileProcessor
         var prefixes = _config.PrefixesFichiers.Split(',').Select(p => p.Trim());
         var suffixes = _config.SuffixesFichiers.Split(',').Select(s => s.Trim());
 
-        string currentPrefix = prefixes.FirstOrDefault(p => fileName.StartsWith(p, StringComparison.OrdinalIgnoreCase));
-        string currentSuffix = suffixes.FirstOrDefault(s => fileName.EndsWith(s, StringComparison.OrdinalIgnoreCase));
+        string? currentPrefix = prefixes.FirstOrDefault(p => fileName.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+        string? currentSuffix = suffixes.FirstOrDefault(s => fileName.EndsWith(s, StringComparison.OrdinalIgnoreCase));
 
         if (currentPrefix != null && currentSuffix != null)
         {
@@ -277,7 +363,7 @@ public class FileProcessor
     /// <summary>
     /// Extrait la date (14 caractères) du nom du fichier selon le format MSC standard.
     /// </summary>
-    private static string ExtractDate(string f)
+    private static string? ExtractDate(string f)
     {
         var p = f.Split('_');
         return p.Length > 1 && p[1].Length >= 14 ? p[1][..14] : null;
@@ -323,7 +409,7 @@ public class FileProcessor
     /// <summary>
     /// Logique de filtrage générique : lit le fichier ligne par ligne, normalise et applique le filtre B ou une valeur fixe.
     /// </summary>
-    private async Task<bool> FilterGeneric(string txt, int numIdx, int filterIdx, string filterVal)
+    private async Task<bool> FilterGeneric(string txt, int numIdx, int filterIdx, string? filterVal)
     {
         bool ok = false;
         string tmp = txt + ".tmp";
@@ -331,7 +417,7 @@ public class FileProcessor
         using (var r = new StreamReader(txt, Encoding.UTF8))
         using (var w = new StreamWriter(tmp, false, Encoding.UTF8))
         {
-            string header = await r.ReadLineAsync();
+            string? header = await r.ReadLineAsync();
             if (header != null) await w.WriteLineAsync(header);
 
             while (!r.EndOfStream)
@@ -363,14 +449,36 @@ public class FileProcessor
     /// </summary>
     private void HandleFtpSendingWithRetry(string file, string dayKey)
     {
-        int tries = 0; bool sent = false;
+        int tries = 0;
+        bool sent = false;
+        string fileName = Path.GetFileName(file);
         string year = dayKey[..4], month = dayKey.Substring(4, 2), day = dayKey.Substring(6, 2);
-        string remotePath = Path.Combine(_config.SftpSettings.UploadPath, "VOICE_SMS", year, month, day);
 
-        while (tries++ < _config.FtpRetryCount && !sent)
+        // Construction du chemin distant formaté pour Linux
+        //string remotePath = $"{_config.SftpSettings.UploadPath}/VOICE_SMS/{year}/{month}/{day}".Replace("\\", "/");
+        string remotePath = _config.SftpSettings.UploadPath.Replace("\\", "/");
+
+        while (tries < _config.FtpRetryCount && !sent)
         {
+            tries++;
             sent = _ftp.SendFile(file, remotePath);
-            if (!sent) Thread.Sleep(_config.FtpRetryDelayMs);
+
+            if (sent)
+            {
+                _logger.LogInformation($"[FTP SUCCESS] Fichier envoyé avec succès : {fileName} vers {remotePath} (Tentative {tries})");
+            }
+            else
+            {
+                _logger.LogWarning($"[FTP RETRY] Échec de l'envoi de {fileName}. Tentative {tries}/{_config.FtpRetryCount}...");
+
+                if (tries < _config.FtpRetryCount)
+                    Thread.Sleep(_config.FtpRetryDelayMs);
+            }
+        }
+
+        if (!sent)
+        {
+            _logger.LogError($"[FTP FATAL] Impossible d'envoyer le fichier {fileName} après {_config.FtpRetryCount} tentatives.");
         }
     }
 }

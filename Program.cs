@@ -21,7 +21,7 @@ internal class Program
                 .UseSerilog((context, services, loggerConfiguration) =>
                 {
                     // On utilise context.Configuration pour accéder aux paramètres du appsettings.json
-                    string logFolder = context.Configuration["ExtractConfig:LogDirectory"];
+                    string logFolder = context.Configuration["ExtractConfig:LogDirectory"] ?? @"E:\Prodige\LOGS";
 
                     if (string.IsNullOrWhiteSpace(logFolder))
                         logFolder = Path.Combine(AppContext.BaseDirectory, "Logs");
